@@ -19,10 +19,11 @@ flutter run
 ```
 
 The main screen:
-- Lets you start/stop listening with the floating microphone button
+- Lets you toggle hands-free listening using the floating button
+- Listens for the wake word **“Pathfinder”**, then records your next spoken command
 - Shows the recognized speech text
 - Shows a preview of the most recent camera frame
-- Displays the model’s response in a card at the bottom
+- Displays the model’s response in a card at the bottom and reads it aloud
 
 ## Running the backend
 

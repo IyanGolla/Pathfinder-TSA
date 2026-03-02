@@ -3,13 +3,15 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-/// Thin HTTP client for talking to the local backend proxy.
+/// Thin HTTP client for talking to the backend proxy.
 class BackendClient {
   const BackendClient({
     this.baseUrl = 'http://localhost:8080/api/openai-proxy',
+    this.streamUrl = 'http://localhost:8080/api/openai-proxy-stream',
   });
 
   final String baseUrl;
+  final String streamUrl;
 
   /// Sends user text and an image to the backend and returns the extracted reply.
   Future<String> sendTextAndImage({
@@ -80,5 +82,41 @@ class BackendClient {
     // If we couldn't interpret the structure, return the raw body.
     return resp.body;
   }
-}
 
+  // Streams the model's reply text back as it is generated.
+  // Current default model seems to return everything in one chunk, so this doesn't change much
+  // TODO: Find a model that does stream longer responses
+  Stream<String> streamTextAndImage({
+    required String text,
+    required Uint8List imageBytes,
+  }) async* {
+    final uri = Uri.parse(streamUrl);
+    final payload = json.encode({
+      'text': text,
+      'image_base64': base64Encode(imageBytes),
+    });
+
+    final client = http.Client();
+    try {
+      final request = http.Request('POST', uri)
+        ..headers['Content-Type'] = 'application/json'
+        ..body = payload;
+
+      final response = await client.send(request);
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final body = await response.stream.bytesToString();
+        throw Exception('Error ${response.statusCode}: $body');
+      }
+
+      // Forward decoded UTF‑8 chunks as they arrive.
+      await for (final chunk in response.stream.transform(utf8.decoder)) {
+        if (chunk.isNotEmpty) {
+          yield chunk;
+        }
+      }
+    } finally {
+      client.close();
+    }
+  }
+}
