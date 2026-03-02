@@ -35,6 +35,9 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   speech_to_text: ^7.0.0
+  camera: ^0.11.0
+  path_provider: ^2.0.15
+  http: ^0.13.6
   
 
 dev_dependencies:
