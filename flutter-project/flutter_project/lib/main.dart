@@ -30,7 +30,6 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-
   // Speech recognition variables
   final SpeechToText _speechToText = SpeechToText();
   bool _speechEnabled = false;
@@ -43,7 +42,7 @@ class _MyHomePageState extends State<MyHomePage> {
   final List<Uint8List> _capturedImages = [];
 
   // Backend communication variables
-  final BackendClient _backendClient = const BackendClient();
+  final BackendClient _backendClient = BackendClient();
   String? _lastAiResponse;
   bool _isSending = false;
   String? _lastError;
@@ -51,10 +50,10 @@ class _MyHomePageState extends State<MyHomePage> {
   // Text-to-speech variables
   final FlutterTts _tts = FlutterTts();
   // TODO: Make these user-customizable via voice commands
-  double _ttsRate = 1;
+  double _ttsRate = 1.3;
   double _ttsPitch = 1.2;
   double _ttsVolume = 1.0;
-  String _ttsLanguage = 'en-US';
+  String _ttsLanguage = 'en-GB';
 
   // Wake-word / hands-free speech state. Initially set to true to start listening immediately.
   bool _wakeListeningEnabled = true;
@@ -118,18 +117,17 @@ class _MyHomePageState extends State<MyHomePage> {
     _capturingCommand = false;
     _currentCommandBuffer = '';
 
-
     // New way to set listening options (old way was deprecated)
     SpeechListenOptions speechListenOptions = SpeechListenOptions(
-      partialResults: true, 
-      cancelOnError: true
+      partialResults: true,
+      cancelOnError: true,
     );
 
     await _speechToText.listen(
       onResult: _onSpeechResult,
       listenFor: const Duration(minutes: 10),
       pauseFor: const Duration(seconds: 3),
-      listenOptions: speechListenOptions
+      listenOptions: speechListenOptions,
     );
 
     setState(() {});
@@ -147,7 +145,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void _onSpeechResult(SpeechRecognitionResult result) {
     final recognized = result.recognizedWords;
 
-    // Update UI to show recognized words 
+    // Update UI to show recognized words
     setState(() {
       _lastWords = recognized;
     });
@@ -195,7 +193,8 @@ class _MyHomePageState extends State<MyHomePage> {
     final s = status.toLowerCase();
 
     // Ensure that the user is finished speaking.
-    final ended = s.contains('notlistening') ||
+    final ended =
+        s.contains('notlistening') ||
         s.contains('not_listening') ||
         s.contains('not listening') ||
         s.contains('done');
@@ -213,8 +212,7 @@ class _MyHomePageState extends State<MyHomePage> {
         // Strip any leading wake word if it slipped into the buffer.
         final lower = command.toLowerCase();
         if (lower.startsWith('pathfinder')) {
-          command =
-              command.substring('pathfinder'.length).trimLeft();
+          command = command.substring('pathfinder'.length).trimLeft();
         }
 
         _lastWords = command;
@@ -392,8 +390,12 @@ class _MyHomePageState extends State<MyHomePage> {
           }
         },
         tooltip:
-            _wakeListeningEnabled ? 'Stop Pathfinder listening' : 'Start Pathfinder listening',
-        child: Icon(_wakeListeningEnabled ? Icons.hearing : Icons.hearing_disabled),
+            _wakeListeningEnabled
+                ? 'Stop Pathfinder listening'
+                : 'Start Pathfinder listening',
+        child: Icon(
+          _wakeListeningEnabled ? Icons.hearing : Icons.hearing_disabled,
+        ),
       ),
     );
   }

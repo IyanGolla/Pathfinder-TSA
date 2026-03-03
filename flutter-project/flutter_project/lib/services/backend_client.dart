@@ -3,9 +3,9 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-/// Thin HTTP client for talking to the backend proxy.
+// HTTP client for talking to the backend proxy.
 class BackendClient {
-  const BackendClient({
+  BackendClient({
     this.baseUrl = 'http://localhost:8080/api/openai-proxy',
     this.streamUrl = 'http://localhost:8080/api/openai-proxy-stream',
   });
@@ -13,16 +13,19 @@ class BackendClient {
   final String baseUrl;
   final String streamUrl;
 
-  /// Sends user text and an image to the backend and returns the extracted reply.
+  // Optional stored session id returned by the backend.
+  // If set, subsequent requests will include it so the backend can maintain conversation memory.
+  String? sessionId;
+
+  // Sends user text and an image to the backend and returns the extracted reply.
   Future<String> sendTextAndImage({
     required String text,
     required Uint8List imageBytes,
   }) async {
     final uri = Uri.parse(baseUrl);
-    final payload = json.encode({
-      'text': text,
-      'image_base64': base64Encode(imageBytes),
-    });
+    final bodyMap = {'text': text, 'image_base64': base64Encode(imageBytes)};
+    if (sessionId != null) bodyMap['sessionId'] = sessionId!;
+    final payload = json.encode(bodyMap);
 
     final resp = await http.post(
       uri,
@@ -36,7 +39,17 @@ class BackendClient {
 
     final data = json.decode(resp.body);
 
-    // Handle OpenAI "responses" style payloads.
+    //If the backend returns our new simplified shape { sessionId, reply, raw }
+    if (data is Map && data['reply'] != null) {
+      if (data['sessionId'] != null) {
+        sessionId = data['sessionId'] as String;
+      }
+      final reply = data['reply'];
+      if (reply is String) return reply;
+      return json.encode(reply);
+    }
+
+    // If the backend returns OpenAI "responses" style payloads.
     if (data is Map && data['output'] != null) {
       final output = data['output'];
       final buffer = StringBuffer();
@@ -91,16 +104,16 @@ class BackendClient {
     required Uint8List imageBytes,
   }) async* {
     final uri = Uri.parse(streamUrl);
-    final payload = json.encode({
-      'text': text,
-      'image_base64': base64Encode(imageBytes),
-    });
+    final bodyMap = {'text': text, 'image_base64': base64Encode(imageBytes)};
+    if (sessionId != null) bodyMap['sessionId'] = sessionId!;
+    final payload = json.encode(bodyMap);
 
     final client = http.Client();
     try {
-      final request = http.Request('POST', uri)
-        ..headers['Content-Type'] = 'application/json'
-        ..body = payload;
+      final request =
+          http.Request('POST', uri)
+            ..headers['Content-Type'] = 'application/json'
+            ..body = payload;
 
       final response = await client.send(request);
 
