@@ -10,6 +10,9 @@ import 'package:speech_to_text/speech_to_text.dart';
 import 'services/backend_client.dart';
 import 'widgets/ai_response_card.dart';
 
+import 'dart:io';
+import "package:flutter/foundation.dart";
+
 void main() {
   runApp(const MyApp());
 }
@@ -63,16 +66,24 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _wakeListeningEnabled = false;
   bool _awaitingWakeWord = false;
   bool _capturingCommand = false;
+  bool _commandProcessing = false; // Prevent duplicate captures
+  bool _isStartingListening = false; // Prevent concurrent startup attempts
   String _currentCommandBuffer = '';
 
   @override
   void initState() {
     super.initState();
     _serverUrlController = TextEditingController();
-    _loadServerUrl();
-    // Prepare speech recognition, text-to-speech, and camera once the widget is ready.
-    _initSpeech();
+    _initializeApp();
+  }
+
+  Future<void> _initializeApp() async {
+    // Load settings first, then initialize
+    await _loadServerUrl();
+    await _loadTtsSettings();
     _initTts();
+    // Prepare speech recognition and camera
+    _initSpeech();
     _initCamera();
   }
 
@@ -91,6 +102,30 @@ class _MyHomePageState extends State<MyHomePage> {
       _serverUrl = url;
       _serverUrlController.text = url;
     });
+  }
+
+  Future<void> _loadTtsSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _ttsRate = prefs.getDouble('ttsRate') ?? 1.0;
+      _ttsPitch = prefs.getDouble('ttsPitch') ?? 1.0;
+      _ttsVolume = prefs.getDouble('ttsVolume') ?? 1.0;
+      _ttsLanguage = prefs.getString('ttsLanguage') ?? 'en-GB';
+    });
+  }
+
+  Future<void> _saveTtsSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('ttsRate', _ttsRate);
+    await prefs.setDouble('ttsPitch', _ttsPitch);
+    await prefs.setDouble('ttsVolume', _ttsVolume);
+    await prefs.setString('ttsLanguage', _ttsLanguage);
+
+    // Update TTS immediately
+    await _tts.setLanguage(_ttsLanguage);
+    await _tts.setSpeechRate(_ttsRate);
+    await _tts.setPitch(_ttsPitch);
+    await _tts.setVolume(_ttsVolume);
   }
 
   void _initSpeech() async {
@@ -131,45 +166,52 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _startListening() async {
-    // Ensure speech listening hasn't already started
-    print("_STARTLISTENING: starting to listen");
+    // Ensure speech listening hasn't already started and we're not already trying to start
     if (!_speechEnabled) return;
-    if (_speechToText.isListening) {
-      print("already listening, not starting again");
+    if (_speechToText.isListening || _isStartingListening) {
+      print("Already listening or starting, skipping");
       return;
     }
 
-    // When listening starts, it should be awaiting wake work and not capturing a command
-    _awaitingWakeWord = true;
-    _capturingCommand = false;
-    _currentCommandBuffer = '';
+    _isStartingListening = true; // Set flag to prevent concurrent attempts
 
-    // New way to set listening options (old way was deprecated)
-    SpeechListenOptions speechListenOptions = SpeechListenOptions(
-      partialResults: true,
-      cancelOnError: true,
-      listenMode:
-          ListenMode
-              .dictation, // Use dictation mode for longer continuous listening
-    );
+    try {
+      // When listening starts, it should be awaiting wake work and not capturing a command
+      _awaitingWakeWord = true;
+      _capturingCommand = false;
+      _currentCommandBuffer = '';
 
-    await _speechToText.listen(
-      onResult: _onSpeechResult,
-      listenFor: const Duration(hours: 1), // Listen for up to 1 hour
-      pauseFor: const Duration(
-        seconds: 30,
-      ), // Pause only after 30 seconds of silence
-      listenOptions: speechListenOptions,
-    );
+      print("Starting speech recognition...");
 
-    setState(() {});
+      // New way to set listening options (old way was deprecated)
+      SpeechListenOptions speechListenOptions = SpeechListenOptions(
+        partialResults: true,
+        cancelOnError: true,
+      );
+
+      await _speechToText.listen(
+        onResult: _onSpeechResult,
+        listenFor: const Duration(hours: 1),
+        pauseFor: const Duration(seconds: 5),
+        listenOptions: speechListenOptions,
+      );
+    } catch (e) {
+      // Suppress the "already started" error - it's harmless and can occur due to race conditions
+      if (!e.toString().contains('already started')) {
+        print("Error starting speech recognition: $e");
+      }
+    } finally {
+      _isStartingListening = false; // Clear flag
+      setState(() {});
+    }
   }
 
   void _stopListening() async {
-    print("_STOPLISTENING: stopping listening");
     _wakeListeningEnabled = false;
     _awaitingWakeWord = false;
     _capturingCommand = false;
+    _commandProcessing = false;
+    _isStartingListening = false;
     _currentCommandBuffer = '';
     await _speechToText.stop();
     setState(() {});
@@ -236,7 +278,9 @@ class _MyHomePageState extends State<MyHomePage> {
     if (!ended) return;
 
     // If we were capturing a command, finalize it and trigger image capture.
-    if (_capturingCommand) {
+    // Use _commandProcessing flag to prevent duplicate captures
+    if (_capturingCommand && !_commandProcessing) {
+      _commandProcessing = true; // Mark that we're processing this command
       String command = _currentCommandBuffer.trim();
       if (command.isEmpty) {
         command = _lastWords.trim();
@@ -255,13 +299,15 @@ class _MyHomePageState extends State<MyHomePage> {
 
       _capturingCommand = false;
       _currentCommandBuffer = '';
+      _commandProcessing = false; // Mark as done processing
     }
 
     // If wake-mode is still enabled, go back to listening for the wake word.
-    if (_wakeListeningEnabled && !_speechToText.isListening) {
+    // Always attempt to restart if wake listening is enabled, with a small delay
+    if (_wakeListeningEnabled) {
       _awaitingWakeWord = true;
-      // Add a small delay to prevent rapid restart loops
-      await Future.delayed(const Duration(milliseconds: 500));
+      // Add a small delay to ensure the previous listen session is fully cleaned up
+      await Future.delayed(const Duration(milliseconds: 300));
       _startListening();
     } else {
       _awaitingWakeWord = false;
@@ -283,7 +329,9 @@ class _MyHomePageState extends State<MyHomePage> {
       // Insert into front of captured images list
       _capturedImages.insert(0, bytes);
       setState(() {});
-      await _sendToBackend(_lastWords, bytes);
+      // Start backend processing in background without awaiting it
+      // This allows speech recognition to restart immediately
+      _sendToBackend(_lastWords, bytes);
     } catch (e) {
       // If capture fails, skip this round and keep going.
     }
@@ -348,19 +396,6 @@ class _MyHomePageState extends State<MyHomePage> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: TextField(
-                controller: _serverUrlController,
-                decoration: InputDecoration(
-                  labelText: 'Server URL',
-                  hintText: 'http://localhost:8080',
-                ),
-                onSubmitted: (value) {
-                  _saveServerUrl(value);
-                },
-              ),
-            ),
             _cameraInitialized && _cameraController != null
                 ? SizedBox(
                   height: 240,
@@ -432,21 +467,195 @@ class _MyHomePageState extends State<MyHomePage> {
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () {
-          if (_wakeListeningEnabled) {
-            _stopListening();
-          } else {
-            _wakeListeningEnabled = true;
-            _startListening();
-          }
-        },
-        tooltip:
-            _wakeListeningEnabled
-                ? 'Stop Pathfinder listening'
-                : 'Start Pathfinder listening',
-        child: Icon(
-          _wakeListeningEnabled ? Icons.hearing : Icons.hearing_disabled,
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          FloatingActionButton(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (context) => SettingsScreen(parent: this),
+                ),
+              );
+            },
+            heroTag: 'settings',
+            tooltip: 'Settings',
+            child: Icon(Icons.settings),
+          ),
+          SizedBox(height: 16),
+          FloatingActionButton(
+            onPressed: () {
+              if (_wakeListeningEnabled) {
+                _stopListening();
+              } else {
+                _wakeListeningEnabled = true;
+                _startListening();
+              }
+            },
+            heroTag: 'listening',
+            tooltip:
+                _wakeListeningEnabled
+                    ? 'Stop Pathfinder listening'
+                    : 'Start Pathfinder listening',
+            child: Icon(
+              _wakeListeningEnabled ? Icons.hearing : Icons.hearing_disabled,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SettingsScreen extends StatefulWidget {
+  final _MyHomePageState parent;
+
+  const SettingsScreen({required this.parent, super.key});
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  late TextEditingController _serverUrlController;
+  late double _ttsRate;
+  late double _ttsPitch;
+  late double _ttsVolume;
+  late String _ttsLanguage;
+
+  @override
+  void initState() {
+    super.initState();
+    _serverUrlController = TextEditingController(
+      text: widget.parent._serverUrl,
+    );
+    _ttsRate = widget.parent._ttsRate;
+    _ttsPitch = widget.parent._ttsPitch;
+    _ttsVolume = widget.parent._ttsVolume;
+    _ttsLanguage = widget.parent._ttsLanguage;
+  }
+
+  @override
+  void dispose() {
+    _serverUrlController.dispose();
+    super.dispose();
+  }
+
+  void _saveSettings() {
+    widget.parent._saveServerUrl(_serverUrlController.text);
+    widget.parent._ttsRate = _ttsRate;
+    widget.parent._ttsPitch = _ttsPitch;
+    widget.parent._ttsVolume = _ttsVolume;
+    widget.parent._ttsLanguage = _ttsLanguage;
+    widget.parent._saveTtsSettings();
+    Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Server URL
+            const Text(
+              'Backend Server',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _serverUrlController,
+              decoration: const InputDecoration(
+                labelText: 'Server URL',
+                hintText: 'http://localhost:8080',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 24),
+
+            // Text-to-Speech Settings
+            const Text(
+              'Text-to-Speech',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+
+            // Language Selection
+            TextField(
+              decoration: const InputDecoration(
+                labelText: 'Language',
+                hintText: 'en-GB',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (value) {
+                setState(() {
+                  _ttsLanguage = value.isEmpty ? 'en-GB' : value;
+                });
+              },
+              controller: TextEditingController(text: _ttsLanguage),
+            ),
+            const SizedBox(height: 16),
+
+            // Speech Rate
+            Text('Speech Rate: ${_ttsRate.toStringAsFixed(2)}'),
+            Slider(
+              value: _ttsRate,
+              min: 0.5,
+              max: 2.0,
+              divisions: 30,
+              label: _ttsRate.toStringAsFixed(2),
+              onChanged: (value) {
+                setState(() {
+                  _ttsRate = value;
+                });
+              },
+            ),
+            const SizedBox(height: 16),
+
+            // Pitch
+            Text('Pitch: ${_ttsPitch.toStringAsFixed(2)}'),
+            Slider(
+              value: _ttsPitch,
+              min: 0.5,
+              max: 2.0,
+              divisions: 30,
+              label: _ttsPitch.toStringAsFixed(2),
+              onChanged: (value) {
+                setState(() {
+                  _ttsPitch = value;
+                });
+              },
+            ),
+            const SizedBox(height: 16),
+
+            // Volume
+            Text('Volume: ${_ttsVolume.toStringAsFixed(2)}'),
+            Slider(
+              value: _ttsVolume,
+              min: 0.0,
+              max: 1.0,
+              divisions: 20,
+              label: _ttsVolume.toStringAsFixed(2),
+              onChanged: (value) {
+                setState(() {
+                  _ttsVolume = value;
+                });
+              },
+            ),
+            const SizedBox(height: 24),
+
+            // Save Button
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _saveSettings,
+                child: const Text('Save Settings'),
+              ),
+            ),
+          ],
         ),
       ),
     );

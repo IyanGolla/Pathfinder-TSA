@@ -158,6 +158,10 @@ app.post('/api/openai-proxy-stream', async (req, res) => {
 
     res.end();
   } catch (err) {
+    // Avoid double-sending errors if stream already started
+    if (res.headersSent) { return; } 
+
+    // Return APIError details if present, otherwise fall back to a generic message
     if (err instanceof OpenAI.APIError) {
       return res.status(err.status || 500).json(err.error || { error: err.message });
     }
