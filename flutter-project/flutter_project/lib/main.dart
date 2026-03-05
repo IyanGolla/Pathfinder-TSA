@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
@@ -42,7 +43,7 @@ class _MyHomePageState extends State<MyHomePage> {
   final List<Uint8List> _capturedImages = [];
 
   // Backend communication variables
-  final BackendClient _backendClient = BackendClient();
+  String _serverUrl = 'http://192.169.215.209:8080';
   String? _lastAiResponse;
   bool _isSending = false;
   String? _lastError;
@@ -50,24 +51,46 @@ class _MyHomePageState extends State<MyHomePage> {
   // Text-to-speech variables
   final FlutterTts _tts = FlutterTts();
   // TODO: Make these user-customizable via voice commands
-  double _ttsRate = 1.3;
-  double _ttsPitch = 1.2;
+  double _ttsRate = 1.0;
+  double _ttsPitch = 1.0;
   double _ttsVolume = 1.0;
   String _ttsLanguage = 'en-GB';
 
-  // Wake-word / hands-free speech state. Initially set to true to start listening immediately.
-  bool _wakeListeningEnabled = true;
-  bool _awaitingWakeWord = true;
+  // UI variables
+  late TextEditingController _serverUrlController;
+
+  // Wake-word / hands-free speech state.
+  bool _wakeListeningEnabled = false;
+  bool _awaitingWakeWord = false;
   bool _capturingCommand = false;
   String _currentCommandBuffer = '';
 
   @override
   void initState() {
     super.initState();
+    _serverUrlController = TextEditingController();
+    _loadServerUrl();
     // Prepare speech recognition, text-to-speech, and camera once the widget is ready.
     _initSpeech();
     _initTts();
     _initCamera();
+  }
+
+  Future<void> _loadServerUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _serverUrl = prefs.getString('serverUrl') ?? 'http://localhost:8080';
+      _serverUrlController.text = _serverUrl;
+    });
+  }
+
+  Future<void> _saveServerUrl(String url) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('serverUrl', url);
+    setState(() {
+      _serverUrl = url;
+      _serverUrlController.text = url;
+    });
   }
 
   void _initSpeech() async {
@@ -109,8 +132,12 @@ class _MyHomePageState extends State<MyHomePage> {
 
   void _startListening() async {
     // Ensure speech listening hasn't already started
+    print("_STARTLISTENING: starting to listen");
     if (!_speechEnabled) return;
-    if (_speechToText.isListening) return;
+    if (_speechToText.isListening) {
+      print("already listening, not starting again");
+      return;
+    }
 
     // When listening starts, it should be awaiting wake work and not capturing a command
     _awaitingWakeWord = true;
@@ -121,12 +148,17 @@ class _MyHomePageState extends State<MyHomePage> {
     SpeechListenOptions speechListenOptions = SpeechListenOptions(
       partialResults: true,
       cancelOnError: true,
+      listenMode:
+          ListenMode
+              .dictation, // Use dictation mode for longer continuous listening
     );
 
     await _speechToText.listen(
       onResult: _onSpeechResult,
-      listenFor: const Duration(minutes: 10),
-      pauseFor: const Duration(seconds: 3),
+      listenFor: const Duration(hours: 1), // Listen for up to 1 hour
+      pauseFor: const Duration(
+        seconds: 30,
+      ), // Pause only after 30 seconds of silence
       listenOptions: speechListenOptions,
     );
 
@@ -134,6 +166,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _stopListening() async {
+    print("_STOPLISTENING: stopping listening");
     _wakeListeningEnabled = false;
     _awaitingWakeWord = false;
     _capturingCommand = false;
@@ -190,6 +223,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _onSpeechStatus(String status) async {
+    print("Speech status: $status");
     final s = status.toLowerCase();
 
     // Ensure that the user is finished speaking.
@@ -226,6 +260,8 @@ class _MyHomePageState extends State<MyHomePage> {
     // If wake-mode is still enabled, go back to listening for the wake word.
     if (_wakeListeningEnabled && !_speechToText.isListening) {
       _awaitingWakeWord = true;
+      // Add a small delay to prevent rapid restart loops
+      await Future.delayed(const Duration(milliseconds: 500));
       _startListening();
     } else {
       _awaitingWakeWord = false;
@@ -260,13 +296,15 @@ class _MyHomePageState extends State<MyHomePage> {
     _lastAiResponse = '';
     setState(() {});
 
+    final backendClient = BackendClient(baseUrl: _serverUrl);
+
     try {
       // Don't start speaking until previous response is finished speaking.
       await _tts.stop();
 
       // Call backendClient to send text and image and interpret response.
       // After each chunk is received, update the UI.
-      await for (final chunk in _backendClient.streamTextAndImage(
+      await for (final chunk in backendClient.streamTextAndImage(
         text: text,
         imageBytes: imageBytes,
       )) {
@@ -288,6 +326,7 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void dispose() {
     _cameraController?.dispose();
+    _serverUrlController.dispose();
     _tts.stop();
     super.dispose();
   }
@@ -309,6 +348,19 @@ class _MyHomePageState extends State<MyHomePage> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: TextField(
+                controller: _serverUrlController,
+                decoration: InputDecoration(
+                  labelText: 'Server URL',
+                  hintText: 'http://localhost:8080',
+                ),
+                onSubmitted: (value) {
+                  _saveServerUrl(value);
+                },
+              ),
+            ),
             _cameraInitialized && _cameraController != null
                 ? SizedBox(
                   height: 240,

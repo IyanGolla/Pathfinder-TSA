@@ -5,13 +5,12 @@ import 'package:http/http.dart' as http;
 
 // HTTP client for talking to the backend proxy.
 class BackendClient {
-  BackendClient({
-    this.baseUrl = 'http://localhost:8080/api/openai-proxy',
-    this.streamUrl = 'http://localhost:8080/api/openai-proxy-stream',
-  });
+  BackendClient({required this.baseUrl});
 
   final String baseUrl;
-  final String streamUrl;
+
+  String get _apiUrl => '$baseUrl/api/openai-proxy';
+  String get streamUrl => '$baseUrl/api/openai-proxy-stream';
 
   // Optional stored session id returned by the backend.
   // If set, subsequent requests will include it so the backend can maintain conversation memory.
@@ -22,7 +21,7 @@ class BackendClient {
     required String text,
     required Uint8List imageBytes,
   }) async {
-    final uri = Uri.parse(baseUrl);
+    final uri = Uri.parse(_apiUrl);
     final bodyMap = {'text': text, 'image_base64': base64Encode(imageBytes)};
     if (sessionId != null) bodyMap['sessionId'] = sessionId!;
     final payload = json.encode(bodyMap);
