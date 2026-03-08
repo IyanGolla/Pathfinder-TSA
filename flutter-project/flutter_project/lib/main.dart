@@ -9,12 +9,84 @@ import 'package:speech_to_text/speech_to_text.dart';
 
 import 'services/backend_client.dart';
 import 'widgets/ai_response_card.dart';
+import 'widgets/object_detection_screen.dart';
+import 'services/object_detector_service.dart';
+import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 
 import 'dart:io';
 import "package:flutter/foundation.dart";
 
 void main() {
   runApp(const MyApp());
+}
+
+class _MainObjectBoundingBoxPainter extends CustomPainter {
+  final List<DetectedObject> objects;
+  final Size imageSize;
+
+  _MainObjectBoundingBoxPainter({
+    required this.objects,
+    required this.imageSize,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final boxPaint =
+        Paint()
+          ..color = Colors.greenAccent
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5;
+
+    final labelBgPaint = Paint()..color = Colors.black54;
+
+    const labelStyle = TextStyle(
+      color: Colors.white,
+      fontSize: 13,
+      fontWeight: FontWeight.w600,
+    );
+
+    for (final obj in objects) {
+      final scaleX = size.width / imageSize.width;
+      final scaleY = size.height / imageSize.height;
+
+      final rect = Rect.fromLTRB(
+        obj.boundingBox.left * scaleX,
+        obj.boundingBox.top * scaleY,
+        obj.boundingBox.right * scaleX,
+        obj.boundingBox.bottom * scaleY,
+      );
+
+      canvas.drawRect(rect, boxPaint);
+
+      String labelText = 'Object';
+      if (obj.labels.isNotEmpty) {
+        final best = obj.labels.reduce(
+          (a, b) => a.confidence >= b.confidence ? a : b,
+        );
+        labelText =
+            '${best.text} ${(best.confidence * 100).toStringAsFixed(0)}%';
+      }
+
+      final tp = TextPainter(
+        text: TextSpan(text: labelText, style: labelStyle),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      final chipRect = Rect.fromLTWH(
+        rect.left,
+        rect.top - tp.height - 4,
+        tp.width + 8,
+        tp.height + 4,
+      );
+      canvas.drawRect(chipRect, labelBgPaint);
+      tp.paint(canvas, Offset(chipRect.left + 4, chipRect.top + 2));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _MainObjectBoundingBoxPainter oldDelegate) {
+    return oldDelegate.objects != objects || oldDelegate.imageSize != imageSize;
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -44,6 +116,11 @@ class _MyHomePageState extends State<MyHomePage> {
   CameraDescription? _cameraDescription;
   bool _cameraInitialized = false;
   final List<Uint8List> _capturedImages = [];
+  // Object detection
+  final _objectDetectorService = ObjectDetectorService();
+  List<DetectedObject> _detectedObjects = [];
+  Size _detectionImageSize = Size.zero;
+  bool _detectionBusy = false;
 
   // Backend communication variables
   String _serverUrl = 'http://192.169.215.209:8080';
@@ -155,13 +232,66 @@ class _MyHomePageState extends State<MyHomePage> {
           _cameraDescription!,
           ResolutionPreset.medium,
           enableAudio: false,
+          imageFormatGroup:
+              Platform.isAndroid
+                  ? ImageFormatGroup.nv21
+                  : ImageFormatGroup.bgra8888,
         );
         await _cameraController!.initialize();
+        // Initialize object detector and start image stream for live detection
+        _objectDetectorService.initialize();
+        try {
+          await _cameraController!.startImageStream(_processCameraImage);
+        } catch (e) {
+          // Some devices or camera plugin versions may not support simultaneous
+          // image stream + picture capture. If starting the stream fails,
+          // continue without the live detection stream.
+          print('Warning: could not start image stream: $e');
+        }
         _cameraInitialized = true;
         setState(() {});
       }
     } catch (e) {
       // If the camera fails, keep the app running in audio-only mode.
+    }
+  }
+
+  void _processCameraImage(CameraImage image) async {
+    if (_detectionBusy) return;
+    _detectionBusy = true;
+
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      _detectionBusy = false;
+      return;
+    }
+
+    final inputImage = _objectDetectorService.inputImageFromCameraImage(
+      image,
+      controller.description,
+      controller.value.deviceOrientation,
+    );
+
+    if (inputImage == null) {
+      _detectionBusy = false;
+      return;
+    }
+
+    try {
+      final objects = await _objectDetectorService.processImage(inputImage);
+      if (mounted) {
+        setState(() {
+          _detectedObjects = objects;
+          _detectionImageSize = Size(
+            image.width.toDouble(),
+            image.height.toDouble(),
+          );
+        });
+      }
+    } catch (e) {
+      // ignore detection errors
+    } finally {
+      _detectionBusy = false;
     }
   }
 
@@ -373,6 +503,10 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   void dispose() {
+    try {
+      _cameraController?.stopImageStream();
+    } catch (_) {}
+    _objectDetectorService.dispose();
     _cameraController?.dispose();
     _serverUrlController.dispose();
     _tts.stop();
@@ -399,7 +533,42 @@ class _MyHomePageState extends State<MyHomePage> {
             _cameraInitialized && _cameraController != null
                 ? SizedBox(
                   height: 240,
-                  child: CameraPreview(_cameraController!),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CameraPreview(_cameraController!),
+                      if (_detectedObjects.isNotEmpty &&
+                          _detectionImageSize != Size.zero)
+                        CustomPaint(
+                          painter: _MainObjectBoundingBoxPainter(
+                            objects: _detectedObjects,
+                            imageSize: _detectionImageSize,
+                          ),
+                        ),
+                      // small badge for count
+                      Positioned(
+                        top: 8,
+                        left: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black54,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            '${_detectedObjects.length} object(s)',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
                 )
                 : SizedBox.shrink(),
             SizedBox(height: 8),
@@ -481,6 +650,19 @@ class _MyHomePageState extends State<MyHomePage> {
             heroTag: 'settings',
             tooltip: 'Settings',
             child: Icon(Icons.settings),
+          ),
+          SizedBox(height: 16),
+          FloatingActionButton(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (context) => const ObjectDetectionScreen(),
+                ),
+              );
+            },
+            heroTag: 'object_detection',
+            tooltip: 'Object Detection',
+            child: Icon(Icons.camera_enhance),
           ),
           SizedBox(height: 16),
           FloatingActionButton(
