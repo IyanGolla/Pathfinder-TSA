@@ -220,7 +220,6 @@ class _DetectorServer {
         _labels = command.args?[2] as List<String>;
         _sendPort.send(const _Command(_Codes.ready));
       case _Codes.detect:
-        print('Received detect command');
         _sendPort.send(const _Command(_Codes.busy));
         _convertCameraImage(command.args?[0] as CameraImage);
       default:

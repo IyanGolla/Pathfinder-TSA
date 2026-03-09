@@ -9,7 +9,7 @@ import 'package:speech_to_text/speech_to_text.dart';
 
 import 'services/backend_client.dart';
 import 'widgets/ai_response_card.dart';
-import 'widgets/detector_screen.dart';
+import '/widgets/detector_screen.dart';
 
 import 'dart:io';
 import "package:flutter/foundation.dart";
@@ -428,7 +428,7 @@ class _MyHomePageState extends State<MyHomePage> {
                     _speechToText.isListening
                         ? _lastWords
                         : (_speechEnabled
-                            ? 'Say \"Pathfinder\" to wake the app.'
+                            ? 'Say "Pathfinder" to wake the app.'
                             : 'Speech not available'),
                   ),
                 ),
