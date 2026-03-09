@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -65,6 +66,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   StreamSubscription? _detectorSubscription;
   List<Recognition>? _recognitions;
   Map<String, String>? _detectionStats;
+  bool _detectionUpdateScheduled = false;
+  DateTime _lastDetectorFrame = DateTime(0); // ADD THIS
 
   /// Set to false to hide the detection performance stats overlay.
   static const bool showDetectionStats = true;
@@ -215,10 +218,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     try {
       _detector = await Detector.start();
       _detectorSubscription = _detector!.resultsStream.stream.listen((values) {
-        setState(() {
-          _recognitions = values['recognitions'];
-          _detectionStats = values['stats'];
-        });
+        // Store latest results but throttle UI rebuilds to avoid
+        // starving the main thread (and speech callbacks).
+        _recognitions = values['recognitions'];
+        _detectionStats = values['stats'];
+        if (!_detectionUpdateScheduled) {
+          _detectionUpdateScheduled = true;
+          Future.delayed(const Duration(milliseconds: 200), () {
+            _detectionUpdateScheduled = false;
+            if (mounted) setState(() {});
+          });
+        }
       });
     } catch (e) {
       debugPrint('Detector init failed: $e');
@@ -227,21 +237,133 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _onCameraFrame(CameraImage image) {
     _latestFrame = image;
-    _detector?.processFrame(image);
+    final now = DateTime.now();
+    if (now.difference(_lastDetectorFrame).inMilliseconds >= 150) {
+      _lastDetectorFrame = now;
+      _detector?.processFrame(image);
+    }
   }
 
   /// Encode the latest stream frame as JPEG for backend use.
-  /// Avoids stopping the image stream (which would interrupt detection).
+  /// Runs conversion on a background isolate to keep the main thread free
+  /// for speech recognition callbacks.
   Future<Uint8List?> _captureFrameFromStream() async {
     final frame = _latestFrame;
     if (frame == null) return null;
 
-    final image = await convertCameraImageToImage(frame);
-    if (image == null) return null;
+    // Serialize CameraImage plane data into transferrable types
+    final planeData =
+        frame.planes
+            .map(
+              (p) => {
+                'bytes': Uint8List.fromList(p.bytes),
+                'bytesPerRow': p.bytesPerRow,
+                'bytesPerPixel': p.bytesPerPixel,
+              },
+            )
+            .toList();
 
-    final oriented =
-        Platform.isAndroid ? image_lib.copyRotate(image, angle: 90) : image;
-    return Uint8List.fromList(image_lib.encodeJpg(oriented, quality: 85));
+    return compute(_encodeFrameToJpeg, {
+      'planes': planeData,
+      'width': frame.width,
+      'height': frame.height,
+      'formatGroup': frame.format.group.name,
+      'isAndroid': Platform.isAndroid,
+    });
+  }
+
+  /// Top-level function for use with compute() — runs on a background isolate.
+  static Uint8List? _encodeFrameToJpeg(Map<String, dynamic> data) {
+    final planes = data['planes'] as List<Map<String, dynamic>>;
+    final width = data['width'] as int;
+    final height = data['height'] as int;
+    final formatName = data['formatGroup'] as String;
+    final isAndroid = data['isAndroid'] as bool;
+
+    image_lib.Image? image;
+
+    if (formatName == 'yuv420') {
+      image = _decodeYuv420(planes, width, height);
+    } else if (formatName == 'bgra8888') {
+      final bytes = planes[0]['bytes'] as Uint8List;
+      image = image_lib.Image.fromBytes(
+        width: width,
+        height: height,
+        bytes: bytes.buffer,
+        order: image_lib.ChannelOrder.rgba,
+      );
+    } else if (formatName == 'jpeg') {
+      image = image_lib.decodeImage(planes[0]['bytes'] as Uint8List);
+    } else if (formatName == 'nv21') {
+      image = _decodeNv21(planes, width, height);
+    }
+
+    if (image == null) return null;
+    if (isAndroid) image = image_lib.copyRotate(image, angle: 90);
+    return Uint8List.fromList(image_lib.encodeJpg(image, quality: 85));
+  }
+
+  static image_lib.Image _decodeYuv420(
+    List<Map<String, dynamic>> planes,
+    int width,
+    int height,
+  ) {
+    final yPlane = planes[0]['bytes'] as Uint8List;
+    final uPlane = planes[1]['bytes'] as Uint8List;
+    final vPlane = planes[2]['bytes'] as Uint8List;
+    final uvRowStride = planes[1]['bytesPerRow'] as int;
+    final uvPixelStride = planes[1]['bytesPerPixel'] as int;
+    final image = image_lib.Image(width: width, height: height);
+    var uvIndex = 0;
+    for (var y = 0; y < height; y++) {
+      var pY = y * width;
+      var pUV = uvIndex;
+      for (var x = 0; x < width; x++) {
+        final yVal = yPlane[pY];
+        final uVal = uPlane[pUV];
+        final vVal = vPlane[pUV];
+        image.setPixelRgba(
+          x,
+          y,
+          (yVal + 1.402 * (vVal - 128)).toInt(),
+          (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128)).toInt(),
+          (yVal + 1.772 * (uVal - 128)).toInt(),
+          255,
+        );
+        pY++;
+        if (x.isOdd) pUV += uvPixelStride;
+      }
+      if (y.isOdd) uvIndex += uvRowStride;
+    }
+    return image;
+  }
+
+  static image_lib.Image _decodeNv21(
+    List<Map<String, dynamic>> planes,
+    int width,
+    int height,
+  ) {
+    final yuvBytes = planes[0]['bytes'] as Uint8List;
+    final vuBytes = planes[1]['bytes'] as Uint8List;
+    final image = image_lib.Image(width: width, height: height);
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        final yIndex = y * width + x;
+        final uvIndex = (y ~/ 2) * (width ~/ 2) + (x ~/ 2);
+        final yVal = yuvBytes[yIndex];
+        final vVal = vuBytes[uvIndex * 2];
+        final uVal = vuBytes[uvIndex * 2 + 1];
+        image.setPixelRgba(
+          x,
+          y,
+          (yVal + 1.402 * (vVal - 128)).toInt(),
+          (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128)).toInt(),
+          (yVal + 1.772 * (uVal - 128)).toInt(),
+          255,
+        );
+      }
+    }
+    return image;
   }
 
   // ── Speech recognition ──
@@ -250,6 +372,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _speechEnabled = await _speechToText.initialize();
     _speechToText.statusListener = _onSpeechStatus;
     setState(() {});
+    // Auto-start listening (matches old working behavior)
+    _startListening();
   }
 
   void _startListening() async {
@@ -265,7 +389,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       await _speechToText.listen(
         onResult: _onSpeechResult,
         listenFor: const Duration(hours: 1),
-        pauseFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 5),
         listenOptions: SpeechListenOptions(
           partialResults: true,
           cancelOnError: true,
@@ -323,48 +447,60 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void _onSpeechStatus(String status) async {
+    print("Speech status: $status");
     final s = status.toLowerCase();
+
+    // Ensure that the user is finished speaking.
     final ended =
         s.contains('notlistening') ||
         s.contains('not_listening') ||
         s.contains('not listening') ||
         s.contains('done');
+
     if (!ended) return;
 
-    // Finalize captured command (the 5-second pause timeout has elapsed,
-    // so _currentCommandBuffer has the complete transcription).
-    if (_capturingCommand && !_commandProcessing) {
-      _commandProcessing = true;
-      String command = _currentCommandBuffer.trim();
-      if (command.isEmpty) command = _lastWords.trim();
+    // Small delay to allow any pending final onResult to arrive. On some
+    // platforms the status event can precede the final result callback by a
+    // few milliseconds; this preserves the last word.
+    if (_capturingCommand)
+      await Future.delayed(const Duration(milliseconds: 150));
 
-      if (command.isNotEmpty) {
-        final lower = command.toLowerCase();
-        for (final wake in ['pathfinder', 'path finder']) {
-          if (lower.startsWith(wake)) {
-            command = command.substring(wake.length).trimLeft();
-            break;
-          }
-        }
-        _lastWords = command;
-        // Wait for capture from the stream, then start backend send (fire-and-forget)
-        await _processCommand(command);
+    // If we were capturing a command, finalize it and trigger image capture.
+    // Use _commandProcessing flag to prevent duplicate captures
+    if (_capturingCommand && !_commandProcessing) {
+      _commandProcessing = true; // Mark that we're processing this command
+      String command = _currentCommandBuffer.trim();
+      if (command.isEmpty) {
+        command = _lastWords.trim();
       }
 
-      // Clear capture state after we've started processing (matches old behavior)
+      if (command.isNotEmpty) {
+        // Strip any leading wake word if it slipped into the buffer.
+        final lower = command.toLowerCase();
+        if (lower.startsWith('pathfinder')) {
+          command = command.substring('pathfinder'.length).trimLeft();
+        }
+
+        _lastWords = command;
+        await _processCommand(_lastWords);
+      }
+
       _capturingCommand = false;
       _currentCommandBuffer = '';
-      _commandProcessing = false;
+      _commandProcessing = false; // Mark as done processing
     }
 
-    // Restart listening for next wake word
+    // If wake-mode is still enabled, go back to listening for the wake word.
+    // Always attempt to restart if wake listening is enabled, with a small delay
     if (_wakeListeningEnabled) {
       _awaitingWakeWord = true;
+      // Add a small delay to ensure the previous listen session is fully cleaned up
       await Future.delayed(const Duration(milliseconds: 300));
       _startListening();
     } else {
       _awaitingWakeWord = false;
     }
+
     setState(() {});
   }
 
@@ -378,7 +514,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _sendToBackend(String text, Uint8List imageBytes) async {
-    if (_isSending) return; // Prevent concurrent backend calls
     _lastError = null;
     _isSending = true;
     _lastAiResponse = '';
@@ -387,6 +522,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final client = BackendClient(baseUrl: _serverUrl);
     try {
       await _tts.stop();
+      print('Sending command: $text');
       await for (final chunk in client.streamTextAndImage(
         text: text,
         imageBytes: imageBytes,
@@ -401,7 +537,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _lastError = e.toString();
     } finally {
       _isSending = false;
-      _commandProcessing = false;
       setState(() {});
     }
   }
