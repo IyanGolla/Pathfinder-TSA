@@ -9,7 +9,8 @@ The user speaks a command (triggered by the wake word **"Pathfinder"**), the app
 <!-- Replace the placeholder below with your flowchart image, e.g.:
      ![App Architecture](assets/docs/flowchart.png)
 -->
-*[ Flowchart image goes here ]*
+
+![App Architecture](/flutter-project/flutter_project/appflowchart.png)
 
 ## Features
 
