@@ -82,13 +82,14 @@ flutter run
 On Android emulators, the backend URL needs to be `http://10.0.2.2:8080` instead of `localhost` (the emulator can't reach the host's localhost directly). You can change this in the app's Settings screen.
 
 ### 3. Use the app
-Note: Android has mic on/off notification noises that cannot be disabled by this software. To turn these off for a smoother experience, reduce your phone's **notification** volume to zero when using the app.
 
 1. Tap the ear icon to enable listening
 2. Say **"Pathfinder"** followed by your question (e.g. "Pathfinder, what's in front of me?")
 3. The app captures a camera frame, sends it with your command, and reads the response aloud
 4. Detected objects are also announced automatically when they're close enough
 5. Tap the eye icon to toggle object detection on or off
+
+Note: Android has mic on/off notification noises that cannot be disabled by this software. To turn these off for a smoother experience, reduce your phone's **notification** volume to zero when using the app.
 
 ## API Endpoints
 
