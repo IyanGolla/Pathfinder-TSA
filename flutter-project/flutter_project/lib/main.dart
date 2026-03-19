@@ -16,7 +16,7 @@ import 'models/recognition.dart';
 import 'models/screen_parameters.dart';
 import 'services/backend_client.dart';
 import 'services/detector_service.dart';
-import 'utils/image_conversion.dart';
+import 'services/object_alert_service.dart';
 import 'widgets/ai_response_card.dart';
 import 'widgets/box_widget.dart';
 import 'widgets/stats_widget.dart';
@@ -27,6 +27,7 @@ void main() async {
   runApp(const MyApp());
 }
 
+/// Root widget — sets up the MaterialApp and theme.
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -43,6 +44,8 @@ class MyApp extends StatelessWidget {
   }
 }
 
+/// Main screen: live camera preview with object detection, speech
+/// recognition, wake-word command capture, and backend AI queries.
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -67,7 +70,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<Recognition>? _recognitions;
   Map<String, String>? _detectionStats;
   bool _detectionUpdateScheduled = false;
-  DateTime _lastDetectorFrame = DateTime(0); // ADD THIS
+  DateTime _lastDetectorFrame = DateTime(0);
+  bool _detectionEnabled = true;
 
   /// Set to false to hide the detection performance stats overlay.
   static const bool showDetectionStats = true;
@@ -85,7 +89,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   double _ttsVolume = 1.0;
   String _ttsLanguage = 'en-GB';
 
+  // ── Object alerts ──
+  final ObjectAlertService _objectAlerts = ObjectAlertService();
+  bool _isSpeakingAlert = false;
+
   // ── Wake-word state machine ──
+  // Flow: mic on → listen for "Pathfinder" → capture everything after
+  // the wake word → speech ends → send command to backend → restart.
   bool _wakeListeningEnabled = false;
   bool _awaitingWakeWord = false;
   bool _capturingCommand = false;
@@ -192,6 +202,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ── Camera & detection ──
 
+  /// Opens the first available camera and starts the image stream.
   Future<void> _initCamera() async {
     try {
       final cameras = await availableCameras();
@@ -214,6 +225,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// Starts the TFLite detector isolate and subscribes to results.
   Future<void> _initDetector() async {
     try {
       _detector = await Detector.start();
@@ -222,6 +234,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         // starving the main thread (and speech callbacks).
         _recognitions = values['recognitions'];
         _detectionStats = values['stats'];
+
+        // Check for new objects to alert the user about
+        if (_recognitions != null && _recognitions!.isNotEmpty) {
+          _checkObjectAlerts(_recognitions!);
+        }
+
         if (!_detectionUpdateScheduled) {
           _detectionUpdateScheduled = true;
           Future.delayed(const Duration(milliseconds: 200), () {
@@ -235,8 +253,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// Callback for each camera frame — throttles to one detector call per 150 ms.
   void _onCameraFrame(CameraImage image) {
     _latestFrame = image;
+    if (!_detectionEnabled) return;
     final now = DateTime.now();
     if (now.difference(_lastDetectorFrame).inMilliseconds >= 150) {
       _lastDetectorFrame = now;
@@ -303,6 +323,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return Uint8List.fromList(image_lib.encodeJpg(image, quality: 85));
   }
 
+  /// Decodes a YUV420 frame into an [image_lib.Image].
   static image_lib.Image _decodeYuv420(
     List<Map<String, dynamic>> planes,
     int width,
@@ -338,6 +359,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return image;
   }
 
+  /// Decodes an NV21 frame into an [image_lib.Image].
   static image_lib.Image _decodeNv21(
     List<Map<String, dynamic>> planes,
     int width,
@@ -368,6 +390,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ── Speech recognition ──
 
+  /// Initializes the speech-to-text engine and starts listening.
   void _initSpeech() async {
     _speechEnabled = await _speechToText.initialize();
     _speechToText.statusListener = _onSpeechStatus;
@@ -376,6 +399,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _startListening();
   }
 
+  /// Begins a new speech recognition session in wake-word mode.
   void _startListening() async {
     if (!_speechEnabled || _speechToText.isListening || _isStartingListening) {
       return;
@@ -405,6 +429,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// Stops speech recognition and resets all wake-word state.
   void _stopListening() {
     _wakeListeningEnabled = false;
     _awaitingWakeWord = false;
@@ -416,6 +441,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() {});
   }
 
+  /// Called with partial and final speech results; detects the wake word
+  /// and buffers everything spoken after it as the command.
   void _onSpeechResult(SpeechRecognitionResult result) {
     final recognized = result.recognizedWords;
     setState(() => _lastWords = recognized);
@@ -446,8 +473,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return null;
   }
 
+  /// Handles speech session lifecycle — finalizes the captured command
+  /// when recognition stops and restarts listening if wake-mode is on.
   void _onSpeechStatus(String status) async {
-    print("Speech status: $status");
+    debugPrint("Speech status: $status");
     final s = status.toLowerCase();
 
     // Ensure that the user is finished speaking.
@@ -459,13 +488,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     if (!ended) return;
 
-    // Small delay to allow any pending final onResult to arrive. On some
-    // platforms the status event can precede the final result callback by a
-    // few milliseconds; this preserves the last word.
+    // 150ms delay to allow any pending final onResult to arrive. On some
+    // platforms the status event can come before the final result callback by a
+    // few milliseconds; this makes sure the last word is captured.
     if (_capturingCommand)
       await Future.delayed(const Duration(milliseconds: 150));
 
-    // If we were capturing a command, finalize it and trigger image capture.
+    // If we were capturing a command, finalize it and trigger the image capture.
     // Use _commandProcessing flag to prevent duplicate captures
     if (_capturingCommand && !_commandProcessing) {
       _commandProcessing = true; // Mark that we're processing this command
@@ -506,6 +535,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // ── Command processing & backend ──
 
+  /// Captures the current camera frame and sends it with the command to the backend.
   Future<void> _processCommand(String command) async {
     final imageBytes = await _captureFrameFromStream();
     if (imageBytes == null) return;
@@ -513,6 +543,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _sendToBackend(command, imageBytes);
   }
 
+  /// Streams the AI response from the backend and speaks it via TTS.
   Future<void> _sendToBackend(String text, Uint8List imageBytes) async {
     _lastError = null;
     _isSending = true;
@@ -522,7 +553,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final client = BackendClient(baseUrl: _serverUrl);
     try {
       await _tts.stop();
-      print('Sending command: $text');
+      debugPrint('Sending command: $text');
       await for (final chunk in client.streamTextAndImage(
         text: text,
         imageBytes: imageBytes,
@@ -549,7 +580,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _tts.stop();
   }
 
-  // ── UI ──
+  // ── Object alert TTS ──
+
+  void _checkObjectAlerts(List<Recognition> recognitions) {
+    final labels = _objectAlerts.getNewAlerts(recognitions);
+    if (labels.isNotEmpty) {
+      _speakObjectAlerts(labels);
+    }
+  }
+
+  void _speakObjectAlerts(List<String> labels) async {
+    // Don't interrupt an AI response or an ongoing alert
+    if (_isSending || _isSpeakingAlert) return;
+
+    _isSpeakingAlert = true;
+    try {
+      final message = labels.length == 1 ? labels.first : labels.join(', ');
+      await _tts.speak(message);
+    } finally {
+      _isSpeakingAlert = false;
+    }
+  }
+
+  // ── Main UI ──
 
   @override
   Widget build(BuildContext context) {
@@ -702,6 +755,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         const SizedBox(height: 16),
         FloatingActionButton(
+          onPressed: _toggleDetection,
+          heroTag: 'detection',
+          tooltip: _detectionEnabled ? 'Disable detection' : 'Enable detection',
+          child: Icon(
+            _detectionEnabled ? Icons.visibility : Icons.visibility_off,
+          ),
+        ),
+        const SizedBox(height: 16),
+        FloatingActionButton(
           onPressed: _toggleListening,
           heroTag: 'listening',
           tooltip: _wakeListeningEnabled ? 'Stop listening' : 'Start listening',
@@ -720,6 +782,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _wakeListeningEnabled = true;
       _startListening();
     }
+  }
+
+  /// Starts or stops object detection and clears any on-screen boxes.
+  void _toggleDetection() {
+    setState(() {
+      _detectionEnabled = !_detectionEnabled;
+      if (!_detectionEnabled) {
+        _recognitions = null;
+        _detectionStats = null;
+      }
+    });
   }
 
   void _openSettings() async {
@@ -747,8 +820,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 }
 
-// ── Settings Screen ──
-
+/// Screen for configuring the backend server URL and TTS parameters.
 class SettingsScreen extends StatefulWidget {
   final String serverUrl;
   final double ttsRate;

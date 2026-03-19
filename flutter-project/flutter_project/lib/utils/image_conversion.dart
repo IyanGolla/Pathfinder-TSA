@@ -3,6 +3,9 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as image_lib;
 
+/// Converts platform-specific CameraImage formats (YUV420, BGRA8888, JPEG,
+/// NV21) into the image_lib.Image type used by the detector.
+
 Future<image_lib.Image?> convertCameraImageToImage(
   CameraImage cameraImage,
 ) async {
@@ -69,10 +72,8 @@ image_lib.Image convertYUV420ToImage(CameraImage cameraImage) {
 }
 
 image_lib.Image convertBGRA8888ToImage(CameraImage cameraImage) {
-  // Extract the bytes from the CameraImage
   final bytes = cameraImage.planes[0].bytes;
 
-  // Create a new Image instance
   final image = image_lib.Image.fromBytes(
     width: cameraImage.width,
     height: cameraImage.height,
@@ -84,21 +85,16 @@ image_lib.Image convertBGRA8888ToImage(CameraImage cameraImage) {
 }
 
 image_lib.Image convertJPEGToImage(CameraImage cameraImage) {
-  // Extract the bytes from the CameraImage
   final bytes = cameraImage.planes[0].bytes;
-
-  // Create a new Image instance from the JPEG bytes
   final image = image_lib.decodeImage(bytes);
 
   return image!;
 }
 
 image_lib.Image convertNV21ToImage(CameraImage cameraImage) {
-  // Extract the bytes from the CameraImage
   final yuvBytes = cameraImage.planes[0].bytes;
   final vuBytes = cameraImage.planes[1].bytes;
 
-  // Create a new Image instance
   final image = image_lib.Image(
     width: cameraImage.width,
     height: cameraImage.height,
@@ -123,11 +119,6 @@ void convertNV21ToRGB(
   int height,
   image_lib.Image image,
 ) {
-  // Conversion logic from NV21 to RGB
-  // ...
-
-  // Example conversion logic using the `imageLib` package
-  // This is just a placeholder and may not be the most efficient method
   for (var y = 0; y < height; y++) {
     for (var x = 0; x < width; x++) {
       final yIndex = y * width + x;
@@ -137,12 +128,10 @@ void convertNV21ToRGB(
       final uValue = vuBytes[uvIndex * 2];
       final vValue = vuBytes[uvIndex * 2 + 1];
 
-      // Convert YUV to RGB
       final r = yValue + 1.402 * (vValue - 128);
       final g = yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128);
       final b = yValue + 1.772 * (uValue - 128);
 
-      // Set the RGB pixel values in the Image instance
       image.setPixelRgba(x, y, r.toInt(), g.toInt(), b.toInt(), 255);
     }
   }

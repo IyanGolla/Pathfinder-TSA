@@ -1,7 +1,7 @@
 import 'dart:math';
 import 'dart:ui';
 
-// Singleton to record size related data
+/// Singleton to record size related data.
 class ScreenParameters {
   static late Size screenSize;
   static late Size previewSize;

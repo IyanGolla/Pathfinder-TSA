@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
-// HTTP client for talking to the backend proxy.
+/// HTTP client for talking to the backend proxy.
 class BackendClient {
   BackendClient({required this.baseUrl});
 
@@ -12,11 +12,11 @@ class BackendClient {
   String get _apiUrl => '$baseUrl/api/openai-proxy';
   String get streamUrl => '$baseUrl/api/openai-proxy-stream';
 
-  // Optional stored session id returned by the backend.
-  // If set, subsequent requests will include it so the backend can maintain conversation memory.
+  /// Optional stored session id returned by the backend.
+  /// If set, subsequent requests will include it so the backend can maintain conversation memory.
   String? sessionId;
 
-  // Sends user text and an image to the backend and returns the extracted reply.
+  /// Sends user text and an image to the backend and returns the reply.
   Future<String> sendTextAndImage({
     required String text,
     required Uint8List imageBytes,
@@ -38,7 +38,7 @@ class BackendClient {
 
     final data = json.decode(resp.body);
 
-    //If the backend returns our new simplified shape { sessionId, reply, raw }
+    //If the backend returns the new simplified shape { sessionId, reply, raw }
     if (data is Map && data['reply'] != null) {
       if (data['sessionId'] != null) {
         sessionId = data['sessionId'] as String;
@@ -95,9 +95,8 @@ class BackendClient {
     return resp.body;
   }
 
-  // Streams the model's reply text back as it is generated.
-  // Current default model seems to return everything in one chunk, so this doesn't change much
-  // TODO: Find a model that does stream longer responses
+  /// Streams the model's reply text back as it is generated.
+  /// Default model usually returns everything in one chunk, so this doesn't affect much.
   Stream<String> streamTextAndImage({
     required String text,
     required Uint8List imageBytes,

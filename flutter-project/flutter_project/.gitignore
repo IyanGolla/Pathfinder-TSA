@@ -47,3 +47,6 @@ app.*.map.json
 # Node / backend related
 **/node_modules/
 backend/.env
+
+# Build outputs
+/build/

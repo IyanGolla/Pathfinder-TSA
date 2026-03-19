@@ -1,6 +1,6 @@
 import 'package:flutter/widgets.dart';
 
-/// Row for one Stats field
+/// Single row in the detection stats overlay.
 class StatsWidget extends StatelessWidget {
   final String left;
   final String right;

@@ -71,19 +71,17 @@ class Detector {
   late final Interpreter _interpreter;
   late final List<String> _labels;
 
-  // To be used by detector (from UI) to send message to our Service ReceivePort
+  /// Used by the detector (from UI) to send messages to the isolate's ReceivePort.
   late final SendPort _sendPort;
 
   bool _isReady = false;
 
-  // // Similarly, StreamControllers are stored in a queue so they can be handled
-  // // asynchronously and serially.
   final StreamController<Map<String, dynamic>> resultsStream =
       StreamController<Map<String, dynamic>>();
 
-  /// Open the database at [path] and launch the server on a background isolate..
+  /// Starts the background isolate and loads the TFLite model.
   static Future<Detector> start() async {
-    print("APP: Starting Detector");
+    debugPrint("APP: Starting Detector");
     final ReceivePort receivePort = ReceivePort();
     // sendPort - To be used by service Isolate to send message to our ReceiverPort
     final Isolate isolate = await Isolate.spawn(
@@ -105,7 +103,7 @@ class Detector {
   static Future<Interpreter> _loadModel() async {
     final interpreterOptions = InterpreterOptions();
 
-    // Use XNNPACK Delegate
+    // Use XNNPACK Delegate on Android
     if (Platform.isAndroid) {
       interpreterOptions.addDelegate(XNNPackDelegate());
     }
@@ -127,18 +125,11 @@ class Detector {
     }
   }
 
-  /// Handler invoked when a message is received from the port communicating
-  /// with the database server.
+  /// Handles messages coming back from the background isolate.
   void _handleCommand(_Command command) {
     switch (command.code) {
       case _Codes.init:
         _sendPort = command.args?[0] as SendPort;
-        // ----------------------------------------------------------------------
-        // Before using platform channels and plugins from background isolates we
-        // need to register it with its root isolate. This is achieved by
-        // acquiring a [RootIsolateToken] which the background isolate uses to
-        // invoke [BackgroundIsolateBinaryMessenger.ensureInitialized].
-        // ----------------------------------------------------------------------
         RootIsolateToken rootIsolateToken = RootIsolateToken.instance!;
         _sendPort.send(
           _Command(
@@ -181,9 +172,7 @@ class _DetectorServer {
 
   final SendPort _sendPort;
 
-  // ----------------------------------------------------------------------
   // Here the plugin is used from the background isolate.
-  // ----------------------------------------------------------------------
 
   /// The main entrypoint for the background isolate sent to [Isolate.spawn].
   static void _run(SendPort sendPort) {
@@ -201,20 +190,8 @@ class _DetectorServer {
   Future<void> _handleCommand(_Command command) async {
     switch (command.code) {
       case _Codes.init:
-        // ----------------------------------------------------------------------
-        // The [RootIsolateToken] is required for
-        // [BackgroundIsolateBinaryMessenger.ensureInitialized] and must be
-        // obtained on the root isolate and passed into the background isolate via
-        // a [SendPort].
-        // ----------------------------------------------------------------------
         RootIsolateToken rootIsolateToken =
             command.args?[0] as RootIsolateToken;
-        // ----------------------------------------------------------------------
-        // [BackgroundIsolateBinaryMessenger.ensureInitialized] for each
-        // background isolate that will use plugins. This sets up the
-        // [BinaryMessenger] that the Platform Channels will communicate with on
-        // the background isolate.
-        // ----------------------------------------------------------------------
         BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
         _interpreter = Interpreter.fromAddress(command.args?[1] as int);
         _labels = command.args?[2] as List<String>;

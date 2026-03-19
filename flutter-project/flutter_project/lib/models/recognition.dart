@@ -28,11 +28,7 @@ class Recognition {
 
   Rect get location => _location;
 
-  /// Returns bounding box rectangle corresponding to the
-  /// displayed image on screen
-  ///
-  /// This is the actual location where rectangle is rendered on
-  /// the screen
+  /// Bounding box scaled to match the on-screen preview size.
   Rect get renderLocation {
     final double scaleX = ScreenParameters.screenPreviewSize.width / 300;
     final double scaleY = ScreenParameters.screenPreviewSize.height / 300;
