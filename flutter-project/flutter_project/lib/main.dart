@@ -1,112 +1,159 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:image/image.dart' as image_lib;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
+import 'models/recognition.dart';
+import 'models/screen_parameters.dart';
 import 'services/backend_client.dart';
+import 'services/detector_service.dart';
+import 'services/object_alert_service.dart';
 import 'widgets/ai_response_card.dart';
+import 'widgets/box_widget.dart';
+import 'widgets/stats_widget.dart';
 
-import 'dart:io';
-import "package:flutter/foundation.dart";
-
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   runApp(const MyApp());
 }
 
+/// Root widget — sets up the MaterialApp and theme.
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(title: 'Flutter Demo', home: MyHomePage());
+    return MaterialApp(
+      title: 'Pathfinder',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      home: const HomePage(),
+    );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key});
+/// Main screen: live camera preview with object detection, speech
+/// recognition, wake-word command capture, and backend AI queries.
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  // Speech recognition variables
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+  // ── Speech recognition ──
   final SpeechToText _speechToText = SpeechToText();
   bool _speechEnabled = false;
   String _lastWords = '';
 
-  // Camera feed variables
+  // ── Camera ──
   CameraController? _cameraController;
-  CameraDescription? _cameraDescription;
   bool _cameraInitialized = false;
-  final List<Uint8List> _capturedImages = [];
+  CameraImage? _latestFrame;
 
-  // Backend communication variables
-  String _serverUrl = 'http://192.169.215.209:8080';
+  // ── Object detection ──
+  Detector? _detector;
+  StreamSubscription? _detectorSubscription;
+  List<Recognition>? _recognitions;
+  Map<String, String>? _detectionStats;
+  bool _detectionUpdateScheduled = false;
+  DateTime _lastDetectorFrame = DateTime(0);
+  bool _detectionEnabled = true;
+
+  /// Set to false to hide the detection performance stats overlay.
+  static const bool showDetectionStats = true;
+
+  // ── Backend / AI ──
+  String _serverUrl = 'http://localhost:8080';
   String? _lastAiResponse;
   bool _isSending = false;
   String? _lastError;
 
-  // Text-to-speech variables
+  // ── Text-to-speech ──
   final FlutterTts _tts = FlutterTts();
-  // TODO: Make these user-customizable via voice commands
   double _ttsRate = 1.0;
   double _ttsPitch = 1.0;
   double _ttsVolume = 1.0;
   String _ttsLanguage = 'en-GB';
 
-  // UI variables
-  late TextEditingController _serverUrlController;
+  // ── Object alerts ──
+  final ObjectAlertService _objectAlerts = ObjectAlertService();
+  bool _isSpeakingAlert = false;
 
-  // Wake-word / hands-free speech state.
+  // ── Wake-word state machine ──
+  // Flow: mic on → listen for "Pathfinder" → capture everything after
+  // the wake word → speech ends → send command to backend → restart.
   bool _wakeListeningEnabled = false;
   bool _awaitingWakeWord = false;
   bool _capturingCommand = false;
-  bool _commandProcessing = false; // Prevent duplicate captures
-  bool _isStartingListening = false; // Prevent concurrent startup attempts
+  bool _commandProcessing = false;
+  bool _isStartingListening = false;
   String _currentCommandBuffer = '';
+
+  // ── Lifecycle ──
 
   @override
   void initState() {
     super.initState();
-    _serverUrlController = TextEditingController();
+    WidgetsBinding.instance.addObserver(this);
     _initializeApp();
   }
 
-  Future<void> _initializeApp() async {
-    // Load settings first, then initialize
-    await _loadServerUrl();
-    await _loadTtsSettings();
-    _initTts();
-    // Prepare speech recognition and camera
-    _initSpeech();
-    _initCamera();
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cameraController?.dispose();
+    _detector?.stop();
+    _detectorSubscription?.cancel();
+    _tts.stop();
+    super.dispose();
   }
 
-  Future<void> _loadServerUrl() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.inactive:
+        _cameraController?.stopImageStream();
+        _detector?.stop();
+        _detectorSubscription?.cancel();
+        _detector = null;
+        _detectorSubscription = null;
+        break;
+      case AppLifecycleState.resumed:
+        _initCamera();
+        _initDetector();
+        break;
+      default:
+    }
+  }
+
+  Future<void> _initializeApp() async {
+    await _loadSettings();
+    _applyTtsSettings();
+    _initSpeech();
+    await _initCamera();
+    await _initDetector();
+  }
+
+  // ── Settings ──
+
+  Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _serverUrl = prefs.getString('serverUrl') ?? 'http://localhost:8080';
-      _serverUrlController.text = _serverUrl;
-    });
-  }
-
-  Future<void> _saveServerUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('serverUrl', url);
-    setState(() {
-      _serverUrl = url;
-      _serverUrlController.text = url;
-    });
-  }
-
-  Future<void> _loadTtsSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
       _ttsRate = prefs.getDouble('ttsRate') ?? 1.0;
       _ttsPitch = prefs.getDouble('ttsPitch') ?? 1.0;
       _ttsVolume = prefs.getDouble('ttsVolume') ?? 1.0;
@@ -114,158 +161,322 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
-  Future<void> _saveTtsSettings() async {
+  Future<void> _saveSettings({
+    String? serverUrl,
+    double? ttsRate,
+    double? ttsPitch,
+    double? ttsVolume,
+    String? ttsLanguage,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('ttsRate', _ttsRate);
-    await prefs.setDouble('ttsPitch', _ttsPitch);
-    await prefs.setDouble('ttsVolume', _ttsVolume);
-    await prefs.setString('ttsLanguage', _ttsLanguage);
-
-    // Update TTS immediately
-    await _tts.setLanguage(_ttsLanguage);
-    await _tts.setSpeechRate(_ttsRate);
-    await _tts.setPitch(_ttsPitch);
-    await _tts.setVolume(_ttsVolume);
-  }
-
-  void _initSpeech() async {
-    // Initialize speech recognition listener and begin listening.
-    _speechEnabled = await _speechToText.initialize();
-    _speechToText.statusListener = _onSpeechStatus;
+    if (serverUrl != null) {
+      _serverUrl = serverUrl;
+      await prefs.setString('serverUrl', serverUrl);
+    }
+    if (ttsRate != null) {
+      _ttsRate = ttsRate;
+      await prefs.setDouble('ttsRate', ttsRate);
+    }
+    if (ttsPitch != null) {
+      _ttsPitch = ttsPitch;
+      await prefs.setDouble('ttsPitch', ttsPitch);
+    }
+    if (ttsVolume != null) {
+      _ttsVolume = ttsVolume;
+      await prefs.setDouble('ttsVolume', ttsVolume);
+    }
+    if (ttsLanguage != null) {
+      _ttsLanguage = ttsLanguage;
+      await prefs.setString('ttsLanguage', ttsLanguage);
+    }
+    _applyTtsSettings();
     setState(() {});
-    _startListening();
   }
 
-  void _initTts() {
-    // Set initial text-to-speech voice settings
+  void _applyTtsSettings() {
     _tts.setLanguage(_ttsLanguage);
     _tts.setSpeechRate(_ttsRate);
     _tts.setPitch(_ttsPitch);
     _tts.setVolume(_ttsVolume);
   }
 
+  // ── Camera & detection ──
+
+  /// Opens the first available camera and starts the image stream.
   Future<void> _initCamera() async {
     try {
       final cameras = await availableCameras();
-      if (cameras.isNotEmpty) {
-        // Use the first camera found
-        // TODO: Make camera selection logic more robust (flip camera option?)
-        _cameraDescription = cameras.first;
-        _cameraController = CameraController(
-          _cameraDescription!,
-          ResolutionPreset.medium,
-          enableAudio: false,
-        );
-        await _cameraController!.initialize();
-        _cameraInitialized = true;
-        setState(() {});
-      }
+      if (cameras.isEmpty) return;
+
+      _cameraController?.dispose();
+      _cameraController = CameraController(
+        cameras.first,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+      await _cameraController!.initialize();
+      await _cameraController!.startImageStream(_onCameraFrame);
+
+      ScreenParameters.previewSize = _cameraController!.value.previewSize!;
+      _cameraInitialized = true;
+      setState(() {});
     } catch (e) {
-      // If the camera fails, keep the app running in audio-only mode.
+      debugPrint('Camera init failed: $e');
     }
   }
 
-  void _startListening() async {
-    // Ensure speech listening hasn't already started and we're not already trying to start
-    if (!_speechEnabled) return;
-    if (_speechToText.isListening || _isStartingListening) {
-      print("Already listening or starting, skipping");
-      return;
+  /// Starts the TFLite detector isolate and subscribes to results.
+  Future<void> _initDetector() async {
+    try {
+      _detector = await Detector.start();
+      _detectorSubscription = _detector!.resultsStream.stream.listen((values) {
+        // Store latest results but throttle UI rebuilds to avoid
+        // starving the main thread (and speech callbacks).
+        _recognitions = values['recognitions'];
+        _detectionStats = values['stats'];
+
+        // Check for new objects to alert the user about
+        if (_recognitions != null && _recognitions!.isNotEmpty) {
+          _checkObjectAlerts(_recognitions!);
+        }
+
+        if (!_detectionUpdateScheduled) {
+          _detectionUpdateScheduled = true;
+          Future.delayed(const Duration(milliseconds: 200), () {
+            _detectionUpdateScheduled = false;
+            if (mounted) setState(() {});
+          });
+        }
+      });
+    } catch (e) {
+      debugPrint('Detector init failed: $e');
+    }
+  }
+
+  /// Callback for each camera frame — throttles to one detector call per 150 ms.
+  void _onCameraFrame(CameraImage image) {
+    _latestFrame = image;
+    if (!_detectionEnabled) return;
+    final now = DateTime.now();
+    if (now.difference(_lastDetectorFrame).inMilliseconds >= 150) {
+      _lastDetectorFrame = now;
+      _detector?.processFrame(image);
+    }
+  }
+
+  /// Encode the latest stream frame as JPEG for backend use.
+  /// Runs conversion on a background isolate to keep the main thread free
+  /// for speech recognition callbacks.
+  Future<Uint8List?> _captureFrameFromStream() async {
+    final frame = _latestFrame;
+    if (frame == null) return null;
+
+    // Serialize CameraImage plane data into transferrable types
+    final planeData =
+        frame.planes
+            .map(
+              (p) => {
+                'bytes': Uint8List.fromList(p.bytes),
+                'bytesPerRow': p.bytesPerRow,
+                'bytesPerPixel': p.bytesPerPixel,
+              },
+            )
+            .toList();
+
+    return compute(_encodeFrameToJpeg, {
+      'planes': planeData,
+      'width': frame.width,
+      'height': frame.height,
+      'formatGroup': frame.format.group.name,
+      'isAndroid': Platform.isAndroid,
+    });
+  }
+
+  /// Top-level function for use with compute() — runs on a background isolate.
+  static Uint8List? _encodeFrameToJpeg(Map<String, dynamic> data) {
+    final planes = data['planes'] as List<Map<String, dynamic>>;
+    final width = data['width'] as int;
+    final height = data['height'] as int;
+    final formatName = data['formatGroup'] as String;
+    final isAndroid = data['isAndroid'] as bool;
+
+    image_lib.Image? image;
+
+    if (formatName == 'yuv420') {
+      image = _decodeYuv420(planes, width, height);
+    } else if (formatName == 'bgra8888') {
+      final bytes = planes[0]['bytes'] as Uint8List;
+      image = image_lib.Image.fromBytes(
+        width: width,
+        height: height,
+        bytes: bytes.buffer,
+        order: image_lib.ChannelOrder.rgba,
+      );
+    } else if (formatName == 'jpeg') {
+      image = image_lib.decodeImage(planes[0]['bytes'] as Uint8List);
+    } else if (formatName == 'nv21') {
+      image = _decodeNv21(planes, width, height);
     }
 
-    _isStartingListening = true; // Set flag to prevent concurrent attempts
+    if (image == null) return null;
+    if (isAndroid) image = image_lib.copyRotate(image, angle: 90);
+    return Uint8List.fromList(image_lib.encodeJpg(image, quality: 85));
+  }
+
+  /// Decodes a YUV420 frame into an [image_lib.Image].
+  static image_lib.Image _decodeYuv420(
+    List<Map<String, dynamic>> planes,
+    int width,
+    int height,
+  ) {
+    final yPlane = planes[0]['bytes'] as Uint8List;
+    final uPlane = planes[1]['bytes'] as Uint8List;
+    final vPlane = planes[2]['bytes'] as Uint8List;
+    final uvRowStride = planes[1]['bytesPerRow'] as int;
+    final uvPixelStride = planes[1]['bytesPerPixel'] as int;
+    final image = image_lib.Image(width: width, height: height);
+    var uvIndex = 0;
+    for (var y = 0; y < height; y++) {
+      var pY = y * width;
+      var pUV = uvIndex;
+      for (var x = 0; x < width; x++) {
+        final yVal = yPlane[pY];
+        final uVal = uPlane[pUV];
+        final vVal = vPlane[pUV];
+        image.setPixelRgba(
+          x,
+          y,
+          (yVal + 1.402 * (vVal - 128)).toInt(),
+          (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128)).toInt(),
+          (yVal + 1.772 * (uVal - 128)).toInt(),
+          255,
+        );
+        pY++;
+        if (x.isOdd) pUV += uvPixelStride;
+      }
+      if (y.isOdd) uvIndex += uvRowStride;
+    }
+    return image;
+  }
+
+  /// Decodes an NV21 frame into an [image_lib.Image].
+  static image_lib.Image _decodeNv21(
+    List<Map<String, dynamic>> planes,
+    int width,
+    int height,
+  ) {
+    final yuvBytes = planes[0]['bytes'] as Uint8List;
+    final vuBytes = planes[1]['bytes'] as Uint8List;
+    final image = image_lib.Image(width: width, height: height);
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        final yIndex = y * width + x;
+        final uvIndex = (y ~/ 2) * (width ~/ 2) + (x ~/ 2);
+        final yVal = yuvBytes[yIndex];
+        final vVal = vuBytes[uvIndex * 2];
+        final uVal = vuBytes[uvIndex * 2 + 1];
+        image.setPixelRgba(
+          x,
+          y,
+          (yVal + 1.402 * (vVal - 128)).toInt(),
+          (yVal - 0.344136 * (uVal - 128) - 0.714136 * (vVal - 128)).toInt(),
+          (yVal + 1.772 * (uVal - 128)).toInt(),
+          255,
+        );
+      }
+    }
+    return image;
+  }
+
+  // ── Speech recognition ──
+
+  /// Initializes the speech-to-text engine and starts listening.
+  void _initSpeech() async {
+    _speechEnabled = await _speechToText.initialize();
+    _speechToText.statusListener = _onSpeechStatus;
+    setState(() {});
+    // Auto-start listening (matches old working behavior)
+    _startListening();
+  }
+
+  /// Begins a new speech recognition session in wake-word mode.
+  void _startListening() async {
+    if (!_speechEnabled || _speechToText.isListening || _isStartingListening) {
+      return;
+    }
+    _isStartingListening = true;
+    _awaitingWakeWord = true;
+    _capturingCommand = false;
+    _currentCommandBuffer = '';
 
     try {
-      // When listening starts, it should be awaiting wake work and not capturing a command
-      _awaitingWakeWord = true;
-      _capturingCommand = false;
-      _currentCommandBuffer = '';
-
-      print("Starting speech recognition...");
-
-      // New way to set listening options (old way was deprecated)
-      SpeechListenOptions speechListenOptions = SpeechListenOptions(
-        partialResults: true,
-        cancelOnError: true,
-      );
-
       await _speechToText.listen(
         onResult: _onSpeechResult,
         listenFor: const Duration(hours: 1),
         pauseFor: const Duration(seconds: 5),
-        listenOptions: speechListenOptions,
+        listenOptions: SpeechListenOptions(
+          partialResults: true,
+          cancelOnError: true,
+        ),
       );
     } catch (e) {
-      // Suppress the "already started" error - it's harmless and can occur due to race conditions
       if (!e.toString().contains('already started')) {
-        print("Error starting speech recognition: $e");
+        debugPrint('Speech listen error: $e');
       }
     } finally {
-      _isStartingListening = false; // Clear flag
+      _isStartingListening = false;
       setState(() {});
     }
   }
 
-  void _stopListening() async {
+  /// Stops speech recognition and resets all wake-word state.
+  void _stopListening() {
     _wakeListeningEnabled = false;
     _awaitingWakeWord = false;
     _capturingCommand = false;
     _commandProcessing = false;
     _isStartingListening = false;
     _currentCommandBuffer = '';
-    await _speechToText.stop();
+    _speechToText.stop();
     setState(() {});
   }
 
+  /// Called with partial and final speech results; detects the wake word
+  /// and buffers everything spoken after it as the command.
   void _onSpeechResult(SpeechRecognitionResult result) {
     final recognized = result.recognizedWords;
-
-    // Update UI to show recognized words
-    setState(() {
-      _lastWords = recognized;
-    });
+    setState(() => _lastWords = recognized);
 
     final lower = recognized.toLowerCase();
 
     if (_awaitingWakeWord) {
-      // Detect the wake work "Pathfinder" that signifies the start of a voice command.
-      if (lower.contains('pathfinder')) {
-        // Ensure nothing interrupts the voice command and it doesn't restart every time new words are recognized
+      final afterIndex = _wakeWordEndIndex(lower);
+      if (afterIndex != null) {
         _awaitingWakeWord = false;
         _capturingCommand = true;
-
-        // Use any words after the wake word as the start of the command.
-        final index = lower.indexOf('pathfinder');
-        String after = '';
-        if (index >= 0) {
-          after = recognized.substring(index + 'pathfinder'.length).trim();
-        }
-        _currentCommandBuffer = after;
-      }
-      // Detect variants of the wake word such as "path finder", making it more forgiving when speaking commands.
-      // Same code as above but with "path finder" instead of "pathfinder"
-      else if (lower.contains('path finder')) {
-        _awaitingWakeWord = false;
-        _capturingCommand = true;
-
-        final index = lower.indexOf('path finder');
-        String after = '';
-        if (index >= 0) {
-          after = recognized.substring(index + 'path finder'.length).trim();
-        }
-        _currentCommandBuffer = after;
+        _currentCommandBuffer = recognized.substring(afterIndex).trim();
       }
       return;
     }
 
     if (_capturingCommand) {
-      // Keep the latest best guess for the full command.
       _currentCommandBuffer = recognized;
     }
   }
 
+  /// Returns the string index just past the wake word, or null if not found.
+  static int? _wakeWordEndIndex(String lower) {
+    for (final wake in ['pathfinder', 'path finder']) {
+      final i = lower.indexOf(wake);
+      if (i >= 0) return i + wake.length;
+    }
+    return null;
+  }
+
+  /// Handles speech session lifecycle — finalizes the captured command
+  /// when recognition stops and restarts listening if wake-mode is on.
   void _onSpeechStatus(String status) async {
-    print("Speech status: $status");
+    debugPrint("Speech status: $status");
     final s = status.toLowerCase();
 
     // Ensure that the user is finished speaking.
@@ -277,7 +488,13 @@ class _MyHomePageState extends State<MyHomePage> {
 
     if (!ended) return;
 
-    // If we were capturing a command, finalize it and trigger image capture.
+    // 150ms delay to allow any pending final onResult to arrive. On some
+    // platforms the status event can come before the final result callback by a
+    // few milliseconds; this makes sure the last word is captured.
+    if (_capturingCommand)
+      await Future.delayed(const Duration(milliseconds: 150));
+
+    // If we were capturing a command, finalize it and trigger the image capture.
     // Use _commandProcessing flag to prevent duplicate captures
     if (_capturingCommand && !_commandProcessing) {
       _commandProcessing = true; // Mark that we're processing this command
@@ -294,7 +511,7 @@ class _MyHomePageState extends State<MyHomePage> {
         }
 
         _lastWords = command;
-        await _captureFrame();
+        await _processCommand(_lastWords);
       }
 
       _capturingCommand = false;
@@ -316,50 +533,34 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {});
   }
 
-  Future<void> _captureFrame() async {
-    // Ensure camera controller exists
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return;
-    }
+  // ── Command processing & backend ──
 
-    try {
-      // TODO: Find optimal image resolution for speed and accuracy.
-      final XFile picture = await _cameraController!.takePicture();
-      final bytes = await picture.readAsBytes();
-      // Insert into front of captured images list
-      _capturedImages.insert(0, bytes);
-      setState(() {});
-      // Start backend processing in background without awaiting it
-      // This allows speech recognition to restart immediately
-      _sendToBackend(_lastWords, bytes);
-    } catch (e) {
-      // If capture fails, skip this round and keep going.
-    }
+  /// Captures the current camera frame and sends it with the command to the backend.
+  Future<void> _processCommand(String command) async {
+    final imageBytes = await _captureFrameFromStream();
+    if (imageBytes == null) return;
+    // Fire-and-forget so speech recognition can restart immediately.
+    _sendToBackend(command, imageBytes);
   }
 
+  /// Streams the AI response from the backend and speaks it via TTS.
   Future<void> _sendToBackend(String text, Uint8List imageBytes) async {
-    // Set sending state to true and reset AI response view
     _lastError = null;
     _isSending = true;
     _lastAiResponse = '';
     setState(() {});
 
-    final backendClient = BackendClient(baseUrl: _serverUrl);
-
+    final client = BackendClient(baseUrl: _serverUrl);
     try {
-      // Don't start speaking until previous response is finished speaking.
       await _tts.stop();
-
-      // Call backendClient to send text and image and interpret response.
-      // After each chunk is received, update the UI.
-      await for (final chunk in backendClient.streamTextAndImage(
+      debugPrint('Sending command: $text');
+      await for (final chunk in client.streamTextAndImage(
         text: text,
         imageBytes: imageBytes,
       )) {
         _lastAiResponse = '$_lastAiResponse$chunk';
         setState(() {});
       }
-      // Speak AI response using text-to-speech
       if (_lastAiResponse != null && _lastAiResponse!.trim().isNotEmpty) {
         await _tts.speak(_lastAiResponse!.trim());
       }
@@ -371,15 +572,7 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  @override
-  void dispose() {
-    _cameraController?.dispose();
-    _serverUrlController.dispose();
-    _tts.stop();
-    super.dispose();
-  }
-
-  void _clearAi() {
+  void _clearAiResponse() {
     setState(() {
       _lastAiResponse = null;
       _lastError = null;
@@ -387,168 +580,300 @@ class _MyHomePageState extends State<MyHomePage> {
     _tts.stop();
   }
 
+  // ── Object alert TTS ──
+
+  void _checkObjectAlerts(List<Recognition> recognitions) {
+    final labels = _objectAlerts.getNewAlerts(recognitions);
+    if (labels.isNotEmpty) {
+      _speakObjectAlerts(labels);
+    }
+  }
+
+  void _speakObjectAlerts(List<String> labels) async {
+    // Don't interrupt an AI response or an ongoing alert
+    if (_isSending || _isSpeakingAlert) return;
+
+    _isSpeakingAlert = true;
+    try {
+      final message = labels.length == 1 ? labels.first : labels.join(', ');
+      await _tts.speak(message);
+    } finally {
+      _isSpeakingAlert = false;
+    }
+  }
+
+  // ── Main UI ──
+
   @override
   Widget build(BuildContext context) {
-    // TODO: Rework entire UI
+    ScreenParameters.screenSize = MediaQuery.sizeOf(context);
+
     return Scaffold(
-      appBar: AppBar(title: Text('Speech Demo')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            _cameraInitialized && _cameraController != null
-                ? SizedBox(
-                  height: 240,
-                  child: CameraPreview(_cameraController!),
-                )
-                : SizedBox.shrink(),
-            SizedBox(height: 8),
-            Container(
-              padding: EdgeInsets.all(16),
-              child: Text(
-                'Recognized words:',
-                style: TextStyle(fontSize: 20.0),
-              ),
-            ),
-            Expanded(
-              child: Container(
-                padding: EdgeInsets.all(16),
-                child: SingleChildScrollView(
-                  child: Text(
-                    _speechToText.isListening
-                        ? _lastWords
-                        : (_speechEnabled
-                            ? 'Say \"Pathfinder\" to wake the app.'
-                            : 'Speech not available'),
-                  ),
-                ),
-              ),
-            ),
-            if (_capturedImages.isNotEmpty) Divider(),
-            if (_capturedImages.isNotEmpty)
-              SizedBox(
-                height: 140,
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    children:
-                        _capturedImages.map((bytes) {
-                          return Padding(
-                            padding: const EdgeInsets.all(8.0),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.memory(bytes, height: 120),
-                            ),
-                          );
-                        }).toList(),
-                  ),
-                ),
-              ),
-            if (_isSending) LinearProgressIndicator(),
-            if (_lastError != null)
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 8,
-                ),
-                child: Text(
-                  'Error: $_lastError',
-                  style: TextStyle(color: Colors.red),
-                ),
-              ),
-            if (_lastAiResponse != null)
-              Padding(
-                padding: const EdgeInsets.all(12.0),
-                child: AiResponseCard(
-                  response: _lastAiResponse!,
-                  onClear: _clearAi,
-                ),
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            _buildCameraPreview(),
+            _buildBoundingBoxes(),
+            _buildBottomOverlay(),
+            if (_isSending)
+              const Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                child: LinearProgressIndicator(),
               ),
           ],
         ),
       ),
-      floatingActionButton: Column(
-        mainAxisAlignment: MainAxisAlignment.end,
+      floatingActionButton: _buildFabs(),
+    );
+  }
+
+  Widget _buildCameraPreview() {
+    if (!_cameraInitialized || _cameraController == null) {
+      return const Center(
+        child: Text(
+          'Initializing camera...',
+          style: TextStyle(color: Colors.white),
+        ),
+      );
+    }
+    return AspectRatio(
+      aspectRatio: 1 / _cameraController!.value.aspectRatio,
+      child: CameraPreview(_cameraController!),
+    );
+  }
+
+  Widget _buildBoundingBoxes() {
+    if (!_cameraInitialized ||
+        _cameraController == null ||
+        _recognitions == null ||
+        _recognitions!.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return AspectRatio(
+      aspectRatio: 1 / _cameraController!.value.aspectRatio,
+      child: Stack(
+        children: _recognitions!.map((r) => BoxWidget(result: r)).toList(),
+      ),
+    );
+  }
+
+  Widget _buildBottomOverlay() {
+    return Positioned(
+      bottom: 80,
+      left: 0,
+      right: 0,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          FloatingActionButton(
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (context) => SettingsScreen(parent: this),
-                ),
-              );
-            },
-            heroTag: 'settings',
-            tooltip: 'Settings',
-            child: Icon(Icons.settings),
-          ),
-          SizedBox(height: 16),
-          FloatingActionButton(
-            onPressed: () {
-              if (_wakeListeningEnabled) {
-                _stopListening();
-              } else {
-                _wakeListeningEnabled = true;
-                _startListening();
-              }
-            },
-            heroTag: 'listening',
-            tooltip:
-                _wakeListeningEnabled
-                    ? 'Stop Pathfinder listening'
-                    : 'Start Pathfinder listening',
-            child: Icon(
-              _wakeListeningEnabled ? Icons.hearing : Icons.hearing_disabled,
+          _buildSpeechStatus(),
+          if (_lastError != null) _buildError(),
+          if (_lastAiResponse != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: AiResponseCard(
+                response: _lastAiResponse!,
+                onClear: _clearAiResponse,
+              ),
             ),
-          ),
+          if (showDetectionStats && _detectionStats != null)
+            _buildDetectionStats(),
         ],
       ),
     );
   }
+
+  Widget _buildSpeechStatus() {
+    String text;
+    if (_speechToText.isListening) {
+      text = _lastWords.isEmpty ? 'Listening...' : _lastWords;
+    } else if (_wakeListeningEnabled) {
+      text = 'Say "Pathfinder" to start a command';
+    } else {
+      text = 'Tap mic to enable listening';
+    }
+
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(color: Colors.white, fontSize: 14),
+        textAlign: TextAlign.center,
+      ),
+    );
+  }
+
+  Widget _buildError() {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.red.withAlpha(204),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        _lastError!,
+        style: const TextStyle(color: Colors.white, fontSize: 12),
+      ),
+    );
+  }
+
+  Widget _buildDetectionStats() {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.white.withAlpha(150),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children:
+            _detectionStats!.entries
+                .map((e) => StatsWidget(e.key, e.value))
+                .toList(),
+      ),
+    );
+  }
+
+  Widget _buildFabs() {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.end,
+      children: [
+        FloatingActionButton(
+          onPressed: _openSettings,
+          heroTag: 'settings',
+          tooltip: 'Settings',
+          child: const Icon(Icons.settings),
+        ),
+        const SizedBox(height: 16),
+        FloatingActionButton(
+          onPressed: _toggleDetection,
+          heroTag: 'detection',
+          tooltip: _detectionEnabled ? 'Disable detection' : 'Enable detection',
+          child: Icon(
+            _detectionEnabled ? Icons.visibility : Icons.visibility_off,
+          ),
+        ),
+        const SizedBox(height: 16),
+        FloatingActionButton(
+          onPressed: _toggleListening,
+          heroTag: 'listening',
+          tooltip: _wakeListeningEnabled ? 'Stop listening' : 'Start listening',
+          child: Icon(
+            _wakeListeningEnabled ? Icons.hearing : Icons.hearing_disabled,
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _toggleListening() {
+    if (_wakeListeningEnabled) {
+      _stopListening();
+    } else {
+      _wakeListeningEnabled = true;
+      _startListening();
+    }
+  }
+
+  /// Starts or stops object detection and clears any on-screen boxes.
+  void _toggleDetection() {
+    setState(() {
+      _detectionEnabled = !_detectionEnabled;
+      if (!_detectionEnabled) {
+        _recognitions = null;
+        _detectionStats = null;
+      }
+    });
+  }
+
+  void _openSettings() async {
+    final result = await Navigator.of(context).push<Map<String, dynamic>>(
+      MaterialPageRoute(
+        builder:
+            (_) => SettingsScreen(
+              serverUrl: _serverUrl,
+              ttsRate: _ttsRate,
+              ttsPitch: _ttsPitch,
+              ttsVolume: _ttsVolume,
+              ttsLanguage: _ttsLanguage,
+            ),
+      ),
+    );
+    if (result != null) {
+      await _saveSettings(
+        serverUrl: result['serverUrl'] as String?,
+        ttsRate: result['ttsRate'] as double?,
+        ttsPitch: result['ttsPitch'] as double?,
+        ttsVolume: result['ttsVolume'] as double?,
+        ttsLanguage: result['ttsLanguage'] as String?,
+      );
+    }
+  }
 }
 
+/// Screen for configuring the backend server URL and TTS parameters.
 class SettingsScreen extends StatefulWidget {
-  final _MyHomePageState parent;
+  final String serverUrl;
+  final double ttsRate;
+  final double ttsPitch;
+  final double ttsVolume;
+  final String ttsLanguage;
 
-  const SettingsScreen({required this.parent, super.key});
+  const SettingsScreen({
+    required this.serverUrl,
+    required this.ttsRate,
+    required this.ttsPitch,
+    required this.ttsVolume,
+    required this.ttsLanguage,
+    super.key,
+  });
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  late TextEditingController _serverUrlController;
+  late final TextEditingController _serverUrlController;
+  late final TextEditingController _languageController;
   late double _ttsRate;
   late double _ttsPitch;
   late double _ttsVolume;
-  late String _ttsLanguage;
 
   @override
   void initState() {
     super.initState();
-    _serverUrlController = TextEditingController(
-      text: widget.parent._serverUrl,
-    );
-    _ttsRate = widget.parent._ttsRate;
-    _ttsPitch = widget.parent._ttsPitch;
-    _ttsVolume = widget.parent._ttsVolume;
-    _ttsLanguage = widget.parent._ttsLanguage;
+    _serverUrlController = TextEditingController(text: widget.serverUrl);
+    _languageController = TextEditingController(text: widget.ttsLanguage);
+    _ttsRate = widget.ttsRate;
+    _ttsPitch = widget.ttsPitch;
+    _ttsVolume = widget.ttsVolume;
   }
 
   @override
   void dispose() {
     _serverUrlController.dispose();
+    _languageController.dispose();
     super.dispose();
   }
 
-  void _saveSettings() {
-    widget.parent._saveServerUrl(_serverUrlController.text);
-    widget.parent._ttsRate = _ttsRate;
-    widget.parent._ttsPitch = _ttsPitch;
-    widget.parent._ttsVolume = _ttsVolume;
-    widget.parent._ttsLanguage = _ttsLanguage;
-    widget.parent._saveTtsSettings();
-    Navigator.of(context).pop();
+  void _save() {
+    Navigator.of(context).pop<Map<String, dynamic>>({
+      'serverUrl': _serverUrlController.text,
+      'ttsRate': _ttsRate,
+      'ttsPitch': _ttsPitch,
+      'ttsVolume': _ttsVolume,
+      'ttsLanguage':
+          _languageController.text.isEmpty ? 'en-GB' : _languageController.text,
+    });
   }
 
   @override
@@ -556,11 +881,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Server URL
             const Text(
               'Backend Server',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -575,31 +899,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             const SizedBox(height: 24),
-
-            // Text-to-Speech Settings
             const Text(
               'Text-to-Speech',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
-
-            // Language Selection
             TextField(
+              controller: _languageController,
               decoration: const InputDecoration(
                 labelText: 'Language',
                 hintText: 'en-GB',
                 border: OutlineInputBorder(),
               ),
-              onChanged: (value) {
-                setState(() {
-                  _ttsLanguage = value.isEmpty ? 'en-GB' : value;
-                });
-              },
-              controller: TextEditingController(text: _ttsLanguage),
             ),
             const SizedBox(height: 16),
-
-            // Speech Rate
             Text('Speech Rate: ${_ttsRate.toStringAsFixed(2)}'),
             Slider(
               value: _ttsRate,
@@ -607,15 +920,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               max: 2.0,
               divisions: 30,
               label: _ttsRate.toStringAsFixed(2),
-              onChanged: (value) {
-                setState(() {
-                  _ttsRate = value;
-                });
-              },
+              onChanged: (v) => setState(() => _ttsRate = v),
             ),
             const SizedBox(height: 16),
-
-            // Pitch
             Text('Pitch: ${_ttsPitch.toStringAsFixed(2)}'),
             Slider(
               value: _ttsPitch,
@@ -623,15 +930,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               max: 2.0,
               divisions: 30,
               label: _ttsPitch.toStringAsFixed(2),
-              onChanged: (value) {
-                setState(() {
-                  _ttsPitch = value;
-                });
-              },
+              onChanged: (v) => setState(() => _ttsPitch = v),
             ),
             const SizedBox(height: 16),
-
-            // Volume
             Text('Volume: ${_ttsVolume.toStringAsFixed(2)}'),
             Slider(
               value: _ttsVolume,
@@ -639,19 +940,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
               max: 1.0,
               divisions: 20,
               label: _ttsVolume.toStringAsFixed(2),
-              onChanged: (value) {
-                setState(() {
-                  _ttsVolume = value;
-                });
-              },
+              onChanged: (v) => setState(() => _ttsVolume = v),
             ),
             const SizedBox(height: 24),
-
-            // Save Button
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: _saveSettings,
+                onPressed: _save,
                 child: const Text('Save Settings'),
               ),
             ),
